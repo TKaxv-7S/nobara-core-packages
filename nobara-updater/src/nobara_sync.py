@@ -30,8 +30,23 @@ from nobara_updater.dnf import (  # type: ignore[import]
     AttributeDict,
     PackageUpdater,
     repoindex,
-    run_system_upgrade_transaction,
+    revert_package_transaction,
+    run_package_upgrade_transaction,
     updatechecker,
+)
+from nobara_updater.grouped_updates import (  # type: ignore[import]
+    FAILURE_MARKER,
+    GroupUpdateResult,
+    GroupedUpdateSummary,
+    PackageGroup,
+    SUCCESS_MARKER,
+    ValidationOutcome,
+    default_package_groups_path,
+    load_package_groups,
+    log_failure_report,
+    requires_module_validation,
+    run_grouped_updates,
+    validate_kernel_modules,
 )
 
 # Force UTF-8 locale for all child processes spawned from this Python process
@@ -70,7 +85,25 @@ class ColorLogFormatter(logging.Formatter):
                     "<span foreground='#FF0000'>✘</span>",
                     f"{Color.RED}✘{Color.END}",
                 )
+            if "[OK]" in log_entry:
+                log_entry = log_entry.replace(
+                    "<span foreground='#00FF00'>[OK]</span>",
+                    f"{Color.GREEN}[OK]{Color.END}",
+                )
+            if "[X]" in log_entry:
+                log_entry = log_entry.replace(
+                    "<span foreground='#FF0000'>[X]</span>",
+                    f"{Color.RED}[X]{Color.END}",
+                )
         return log_entry
+
+
+class PlainLogFormatter(logging.Formatter):
+    """Remove Pango color markup from the persistent plain-text log."""
+
+    def format(self, record):
+        log_entry = super().format(record)
+        return re.sub(r"</?span(?:\s+[^>]*)?>", "", log_entry)
 
 
 class TextViewHandler(logging.Handler):
@@ -154,7 +187,7 @@ def initialize_logging(textview: Gtk.TextView = None) -> logging.Logger:
     file_handler = logging.FileHandler(log_file, mode="w")
     file_handler.setLevel(logging.INFO)
     # Create formatter for the file handler
-    file_formatter = logging.Formatter(
+    file_formatter = PlainLogFormatter(
         "%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
     file_handler.setFormatter(file_formatter)
@@ -610,7 +643,7 @@ def kernel_image_supported() -> bool:
                 text=True, encoding="utf-8", errors="replace",
                 check=True
         )
-        if image_type == "uki":
+        if image_type.stdout.strip() == "uki":
             logger.info("Upgrade of unsupported kernel install detected. You are on your own.")
             return False
         else:
@@ -625,48 +658,113 @@ def install_system_updates_only() -> bool:
 
     package_names = updatechecker()
     success = True
+    summary = GroupedUpdateSummary(())
+    grouped_validation_covered = False
+    standalone_kernel_validation = False
 
     logger.info("Starting SYSTEM package updates, please do not turn off your computer...\n")
     if package_names:
         logger.info("Upgrading packages:\n%s", "\n".join(package_names))
-        success = run_system_upgrade_transaction(logger)
-        if not success:
-            logger.error("DNF System Updates failed!")
-
-    # Perform dracut if kernel was updated.
-    if success and perform_kernel_actions == 1:
-        supported = kernel_image_supported()
-        if supported:
-            logger.info(
-                "Kernel or kernel module updates were performed. Running required 'dracut -f'...\n"
-            )
-            try:
-                result = subprocess.run(
-                    "ls /boot/ | grep vmlinuz | grep -v rescue",
-                    shell=True,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                    check=True,
+        try:
+            package_groups = load_package_groups(default_package_groups_path())
+        except (OSError, ValueError) as error:
+            logger.info("%s Package groups - configuration failed", FAILURE_MARKER)
+            summary = GroupedUpdateSummary(
+                (
+                    GroupUpdateResult(
+                        key="package groups",
+                        label="Package groups",
+                        packages=tuple(package_names),
+                        success=False,
+                        failure_reason=str(error),
+                    ),
                 )
-                lines = result.stdout.strip().split("\n")
-                versions = [line.replace("vmlinuz-", "") for line in lines if line.startswith("vmlinuz-")]
+            )
+            success = False
+        else:
+            def transaction_runner(packages, group: PackageGroup):
+                return run_package_upgrade_transaction(
+                    tuple(packages),
+                    logger,
+                    description=f"nobara-updater grouped update: {group.label}",
+                )
 
-                result = subprocess.run(["ls", "/lib/modules"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=True)
-                modules = result.stdout.strip().split()
+            def rollback_runner(transaction_id: int, group: PackageGroup):
+                return revert_package_transaction(
+                    transaction_id,
+                    logger,
+                    description=f"nobara-updater grouped rollback: {group.label}",
+                )
 
-                filtered_modules = [module for module in modules if module not in versions]
-                for directory in filtered_modules:
-                    if directory:
-                        dir_path = os.path.join("/lib/modules", directory)
-                        if os.path.exists(dir_path):
-                            shutil.rmtree(dir_path)
-            except subprocess.CalledProcessError as e:
-                print(f"An error occurred: {e}")
+            def validator(
+                group: PackageGroup, packages, after_rollback: bool
+            ) -> ValidationOutcome:
+                return validate_kernel_modules(
+                    group,
+                    packages,
+                    logger,
+                    after_rollback=after_rollback,
+                    dracut_enabled=kernel_image_supported(),
+                )
 
-            subprocess.run(["dracut", "-f", "--regenerate-all"], check=True)
+            summary = run_grouped_updates(
+                package_names,
+                package_groups,
+                transaction_runner,
+                rollback_runner,
+                validator,
+                logger,
+            )
+            grouped_validation_covered = any(
+                result.packages
+                and (
+                    result.key == "kernel"
+                    or requires_module_validation(result.packages)
+                )
+                for result in summary.results
+            )
+            success = summary.success
+
+    # Some legacy fixups install kernels or driver modules before the grouped
+    # pending-update pass.  If no package group already validated that global
+    # module state, retain the required dracut/module check here.
+    if perform_kernel_actions == 1 and not grouped_validation_covered:
+        standalone_kernel_validation = True
+        fixup_group = PackageGroup("kernel", "Pre-update kernel/module fixups", ())
+        validation = validate_kernel_modules(
+            fixup_group,
+            (),
+            logger,
+            dracut_enabled=kernel_image_supported(),
+        )
+        if validation.success:
+            logger.info("%s %s", SUCCESS_MARKER, fixup_group.label)
+        else:
+            logger.info("%s %s", FAILURE_MARKER, fixup_group.label)
+            summary = GroupedUpdateSummary(
+                summary.results
+                + (
+                    GroupUpdateResult(
+                        key="pre-update fixups",
+                        label=fixup_group.label,
+                        packages=(),
+                        success=False,
+                        changed=True,
+                        failure_reason=validation.error
+                        or "Kernel module/initramfs validation failed",
+                    ),
+                )
+            )
+            success = False
+
+    if package_names or not summary.success:
+        log_failure_report(summary, logger)
+
+    if not success:
+        logger.error("One or more DNF package update groups failed.")
+
+    if summary.kernel_or_module_update_applied:
         perform_reboot_request = 1
-    elif not success:
-        logger.info("Skipping post-update kernel/reboot actions because system package updates failed.")
 
     # Send update refresh request to systray service
     orig_user_uid, orig_user_gid = get_orig_user_ids()
@@ -679,11 +777,28 @@ def install_system_updates_only() -> bool:
         except OSError as e:
             logger.error("Error: %s", e.strerror)
 
-    if success and perform_reboot_request == 1:
+    successful_changed_packages = {
+        package
+        for result in summary.results
+        if result.success and result.changed
+        for package in result.packages
+    }
+    applied_reboot_relevant_update = (
+        summary.kernel_or_module_update_applied
+        or any(
+            "kwin" in package.lower()
+            or "mutter" in package.lower()
+            or "gamescope" in package.lower()
+            for package in successful_changed_packages
+        )
+        or (standalone_kernel_validation and success)
+    )
+
+    if perform_reboot_request == 1 and (success or applied_reboot_relevant_update):
         logger.info("Kernel, kernel module, or desktop compositor update performed. Reboot required.")
         prompt_reboot()
-    elif not success and perform_reboot_request == 1:
-        logger.info("Skipping reboot request because system package updates failed.")
+    elif perform_reboot_request == 1:
+        logger.info("Skipping reboot request because no reboot-relevant group completed successfully.")
 
     return success
 

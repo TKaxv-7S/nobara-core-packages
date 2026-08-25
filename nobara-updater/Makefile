@@ -5,6 +5,7 @@ DESKTOP_DIR := $(DESTDIR)/usr/share/applications
 CODEC_WIZARD_DIR := $(DESTDIR)/usr/share/nobara-codec-wizard
 ICON_DIR := $(DESTDIR)/usr/share/icons/hicolor/64x64/apps
 LICENSE_DIR := $(DESTDIR)/usr/share/licenses/nobara-updater
+SHARE_DIR := $(DESTDIR)/usr/share/nobara-updater
 
 .PHONY: all install symlinks clean
 
@@ -14,6 +15,7 @@ install:
 	@echo "Installing Python files to $(TARGET_DIR)"
 	mkdir -p $(TARGET_DIR)
 	install -m 644 src/dnf.py $(TARGET_DIR)/dnf.py
+	install -m 644 src/grouped_updates.py $(TARGET_DIR)/grouped_updates.py
 	install -m 644 src/quirks.py $(TARGET_DIR)/quirks.py
 	install -m 644 src/run_as.py $(TARGET_DIR)/run_as.py
 	install -m 644 src/run_as_user_target.py $(TARGET_DIR)/run_as_user_target.py
@@ -39,6 +41,10 @@ install:
 	mkdir -p $(LICENSE_DIR)
 	install -m 644 licenses/LICENSE $(LICENSE_DIR)/LICENSE
 
+	@echo "Installing package group data to $(SHARE_DIR)"
+	mkdir -p $(SHARE_DIR)
+	install -m 644 data/package-groups.txt $(SHARE_DIR)/package-groups.txt
+
 	@echo "Main executable file to $(BIN_DIR)"
 	mkdir -p $(BIN_DIR)
 	install -m 755 src/nobara_sync.py $(BIN_DIR)/nobara-updater
@@ -55,3 +61,4 @@ clean:
 	rm -rf $(DESKTOP_DIR)
 	rm -rf $(ICON_DIR)
 	rm -rf $(CODEC_WIZARD_DIR)
+	rm -rf $(SHARE_DIR)

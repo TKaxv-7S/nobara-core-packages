@@ -16,6 +16,8 @@ import gi  # type: ignore[import]
 import subprocess
 import os
 import contextlib
+import uuid
+from dataclasses import dataclass
 
 gi.require_version("Gtk", "3.0")
 
@@ -164,8 +166,8 @@ def updatechecker(retries: int = 3, delay: int = 5) -> list[str]:
         base = dnf5_base.Base()
         try:
             config = base.get_config()
-            config.get_metadata_expire_option().from_string("0")
-            config.get_obsoletes_option().from_string("true")
+            config.get_metadata_expire_option().set(0)
+            config.get_obsoletes_option().set(True)
 
             base.load_config()
             base.setup()
@@ -432,6 +434,11 @@ class _UpgradeTransactionCallbacks(dnf5_rpm.TransactionCallbacks):
         super().__init__()
         self.logger = logger
         self.total_packages = total_packages
+        self.script_errors: list[str] = []
+
+    @property
+    def had_script_error(self) -> bool:
+        return bool(self.script_errors)
 
     def transaction_start(self, total: int) -> None:
         self.logger.info("Preparing transaction (%s items)...", total)
@@ -457,104 +464,415 @@ class _UpgradeTransactionCallbacks(dnf5_rpm.TransactionCallbacks):
         )
 
     def script_error(self, item, nevra, type, return_code: int) -> None:
-        self.logger.warning(
-            "    Scriptlet for %s exited with code %s", _format_nevra(nevra), return_code
+        failure = f"Scriptlet for {_format_nevra(nevra)} exited with code {return_code}"
+        self.script_errors.append(failure)
+        self.logger.error(
+            "    %s",
+            failure,
         )
 
 
-def run_system_upgrade_transaction(logger: logging.Logger | None = None) -> bool:
-    tx_logger = logger if logger is not None else logging.getLogger()
+@dataclass(frozen=True)
+class DnfTransactionOutcome:
+    success: bool
+    transaction_id: int | None = None
+    packages: tuple[str, ...] = ()
+    error: str | None = None
+    changed: bool = False
+    interrupted: bool = False
+
+
+def _transaction_package_names(transaction) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                item.get_package().get_name()
+                for item in transaction.get_transaction_packages()
+            }
+        )
+    )
+
+
+def _installed_package_specs(base: dnf5_base.Base) -> frozenset[str]:
+    installed_query = dnf5_rpm.PackageQuery(base)
+    installed_query.filter_installed()
+    specs: set[str] = set()
+    for package in installed_query:
+        specs.add(package.get_name())
+        specs.add(f"{package.get_name()}.{package.get_arch()}")
+    return frozenset(specs)
+
+
+def _latest_history_id(base: dnf5_base.Base) -> int:
+    try:
+        return int(base.get_transaction_history().get_latest_transaction().get_id())
+    except Exception:
+        return 0
+
+
+def _find_history_transaction_id(
+    previous_id: int, description: str, tx_logger: logging.Logger
+) -> int | None:
+    """Find the exact history entry created by a named transaction.
+
+    Never use ``history undo last`` here: another package-management client
+    could otherwise make "last" refer to a transaction that nobara-updater did
+    not create.
+    """
+
+    history_base = dnf5_base.Base()
+    try:
+        history_base.load_config()
+        history_base.setup()
+        history = history_base.get_transaction_history()
+        latest_id = _latest_history_id(history_base)
+        if latest_id <= previous_id:
+            return None
+
+        transactions = history.list_transactions(previous_id + 1, latest_id)
+        for index in range(len(transactions) - 1, -1, -1):
+            history_transaction = transactions[index]
+            if history_transaction.get_description() == description:
+                return int(history_transaction.get_id())
+    except Exception as error:
+        tx_logger.error("Could not identify the DNF history transaction: %s", error)
+    finally:
+        del history_base
+    return None
+
+
+def _prepare_transaction_base(
+    tx_logger: logging.Logger, *, refresh_metadata: bool
+) -> dnf5_base.Base:
     base = dnf5_base.Base()
-    download_callbacks = None
-    download_callbacks_ptr = None
+    config = base.get_config()
+    if refresh_metadata:
+        config.get_metadata_expire_option().set(0)
+    config.get_obsoletes_option().set(True)
+    # Exact history records are the rollback boundary for each package group.
+    # Force recording even if the local dnf.conf disables it.
+    config.get_history_record_option().set(True)
+
+    base.load_config()
+    base.setup()
+    sack = base.get_repo_sack()
+    sack.create_repos_from_system_configuration()
+    if refresh_metadata:
+        _expire_enabled_repositories(base, tx_logger)
+    sack.load_repos()
+    return base
+
+
+def _resolve_failure_reason(
+    transaction,
+    *,
+    strict_logs: bool = False,
+    allowed_log_problems: set[int] | None = None,
+) -> str | None:
+    conflicts = [
+        package.get_nevra() for package in transaction.get_conflicting_packages()
+    ]
+    if conflicts:
+        return "Package conflicts: " + ", ".join(conflicts)
+
+    broken = [
+        package.get_nevra()
+        for package in transaction.get_broken_dependency_packages()
+    ]
+    if broken:
+        return "Broken package dependencies: " + ", ".join(broken)
+
+    if strict_logs:
+        nonfatal_problems = {
+            dnf5_base.GoalProblem_NO_PROBLEM,
+            dnf5_base.GoalProblem_ALREADY_INSTALLED,
+            dnf5_base.GoalProblem_INSTALLED_LOWEST_VERSION,
+            dnf5_base.GoalProblem_HINT_ALTERNATIVES,
+            dnf5_base.GoalProblem_HINT_ICASE,
+        }
+        if allowed_log_problems:
+            nonfatal_problems.update(allowed_log_problems)
+        for resolve_log in transaction.get_resolve_logs():
+            if resolve_log.get_problem() not in nonfatal_problems:
+                return f"Package resolution failed: {resolve_log.to_string()}"
+    return None
+
+
+def _execute_resolved_transaction(
+    base: dnf5_base.Base,
+    transaction,
+    tx_logger: logging.Logger,
+    description: str,
+) -> DnfTransactionOutcome:
+    packages = _transaction_package_names(transaction)
+    if transaction.empty():
+        tx_logger.info("Nothing to do.")
+        return DnfTransactionOutcome(True, packages=packages)
+
+    _log_transaction_packages(transaction, tx_logger)
+    download_callbacks = _DownloadCallbacks(tx_logger)
+    download_callbacks_ptr = dnf5_repo.DownloadCallbacksUniquePtr(download_callbacks)
+    base.set_download_callbacks(download_callbacks_ptr)
+
+    tx_logger.info("Downloading packages...")
+    try:
+        transaction.download()
+    except Exception as error:
+        download_failure_logged = download_callbacks.had_failure
+        tx_logger.error("DNF package download failed: %s", error)
+        _log_transaction_failure_details(
+            transaction,
+            tx_logger,
+            log_generic_fallback=not download_failure_logged,
+        )
+        return DnfTransactionOutcome(
+            False,
+            packages=packages,
+            error=f"Package download failed: {error}",
+        )
+
+    previous_history_id = _latest_history_id(base)
+    transaction.set_description(description)
+    tx_logger.info("Running transaction...")
+
+    # Keep both Python SWIG directors alive until transaction.run() returns.
+    # Inline UniquePtr construction drops the Python proxy and causes callback
+    # dispatch to abort with Swig::DirectorMethodException.
+    callbacks = _UpgradeTransactionCallbacks(
+        tx_logger, transaction.get_transaction_packages_count()
+    )
+    callbacks_ptr = dnf5_rpm.TransactionCallbacksUniquePtr(callbacks)
+    transaction.set_callbacks(callbacks_ptr)
 
     try:
-        config = base.get_config()
-        config.get_metadata_expire_option().from_string("0")
-        config.get_obsoletes_option().from_string("true")
+        result = transaction.run()
+    except KeyboardInterrupt:
+        transaction_id = _find_history_transaction_id(
+            previous_history_id, description, tx_logger
+        )
+        tx_logger.error("DNF transaction was interrupted.")
+        return DnfTransactionOutcome(
+            False,
+            transaction_id=transaction_id,
+            packages=packages,
+            error="DNF transaction was interrupted",
+            changed=True,
+            interrupted=True,
+        )
+    except Exception as error:
+        transaction_id = _find_history_transaction_id(
+            previous_history_id, description, tx_logger
+        )
+        tx_logger.error("DNF transaction failed: %s", error)
+        return DnfTransactionOutcome(
+            False,
+            transaction_id=transaction_id,
+            packages=packages,
+            error=f"DNF transaction raised an exception: {error}",
+            # Once rpm execution starts, conservatively require rollback even
+            # if libdnf5 failed before it could persist a history record.
+            changed=True,
+        )
 
-        base.load_config()
-        base.setup()
-        download_callbacks = _DownloadCallbacks(tx_logger)
-        download_callbacks_ptr = dnf5_repo.DownloadCallbacksUniquePtr(download_callbacks)
-        base.set_download_callbacks(download_callbacks_ptr)
+    transaction_id = _find_history_transaction_id(
+        previous_history_id, description, tx_logger
+    )
+    item_errors = _transaction_has_errors(transaction, tx_logger)
+    if (
+        result != dnf5_base.Transaction.TransactionRunResult_SUCCESS
+        or item_errors
+        or callbacks.had_script_error
+    ):
+        result_text = dnf5_base.Transaction.transaction_result_to_string(result)
+        error_parts = [f"DNF transaction result: {result_text}"]
+        if callbacks.script_errors:
+            error_parts.extend(callbacks.script_errors)
+        tx_logger.error("DNF transaction failed: %s", "; ".join(error_parts))
+        for problem in transaction.get_transaction_problems():
+            tx_logger.error(problem)
+        return DnfTransactionOutcome(
+            False,
+            transaction_id=transaction_id,
+            packages=packages,
+            error="; ".join(error_parts),
+            changed=True,
+        )
 
-        sack = base.get_repo_sack()
-        sack.create_repos_from_system_configuration()
-        _expire_enabled_repositories(base, tx_logger)
-        sack.load_repos()
+    tx_logger.info("DNF transaction complete.")
+    return DnfTransactionOutcome(
+        True,
+        transaction_id=transaction_id,
+        packages=packages,
+        changed=True,
+    )
 
+
+def run_package_upgrade_transaction(
+    package_names: list[str] | tuple[str, ...],
+    logger: logging.Logger | None = None,
+    *,
+    description: str | None = None,
+    refresh_metadata: bool = False,
+) -> DnfTransactionOutcome:
+    """Upgrade only the supplied package specs in one DNF transaction."""
+
+    tx_logger = logger if logger is not None else logging.getLogger()
+    targets = tuple(dict.fromkeys(name for name in package_names if name))
+    if not targets:
+        return DnfTransactionOutcome(True)
+
+    transaction_description = (
+        f"{description or 'nobara-updater package transaction'} [{uuid.uuid4()}]"
+    )
+    base: dnf5_base.Base | None = None
+    try:
+        base = _prepare_transaction_base(
+            tx_logger, refresh_metadata=refresh_metadata
+        )
         goal = dnf5_base.Goal(base)
-        goal.add_upgrade("*")
+        job_settings = dnf5_base.GoalJobSettings()
+        job_settings.set_best(True)
+        job_settings.set_skip_broken(False)
+        job_settings.set_skip_unavailable(False)
+        installed_specs = _installed_package_specs(base)
+        for target in targets:
+            if target == "*" or target in installed_specs:
+                goal.add_upgrade(target, job_settings)
+            else:
+                # updatechecker also reports INSTALL items introduced by the
+                # all-upgrades solution (new dependencies and obsoleting
+                # replacement packages).  They are legitimate targets because
+                # they came from the pending list, even though no package with
+                # that name is installed yet.
+                goal.add_install(target, job_settings)
 
-        try:
-            install_only_names = config.installonlypkgs
-        except AttributeError:
-            install_only_names = []
-
-        _add_resolvable_installonly_upgrades(base, goal, install_only_names)
+        if targets == ("*",):
+            try:
+                install_only_names = base.get_config().installonlypkgs
+            except AttributeError:
+                install_only_names = []
+            _add_resolvable_installonly_upgrades(base, goal, install_only_names)
 
         transaction = goal.resolve()
         _log_transaction_resolve_problems(transaction, tx_logger)
-
-        if transaction.get_conflicting_packages():
-            return False
-
-        if transaction.get_broken_dependency_packages():
-            return False
-
-        if transaction.empty():
-            tx_logger.info("Nothing to do.")
-            return True
-
-        _log_transaction_packages(transaction, tx_logger)
-
-        tx_logger.info("Downloading packages...")
-        try:
-            transaction.download()
-        except Exception as e:
-            download_failure_logged = bool(
-                download_callbacks is not None and download_callbacks.had_failure
+        resolve_failure = _resolve_failure_reason(transaction, strict_logs=True)
+        if resolve_failure is not None:
+            return DnfTransactionOutcome(
+                False,
+                packages=_transaction_package_names(transaction),
+                error=resolve_failure,
             )
-            tx_logger.error("DNF package download failed: %s", e)
-            _log_transaction_failure_details(
-                transaction,
-                tx_logger,
-                log_generic_fallback=not download_failure_logged,
-            )
-            return False
 
-        tx_logger.info("Running transaction...")
-        # Keep the Python SWIG director alive until transaction.run() returns.
-        # Passing it to TransactionCallbacksUniquePtr inline leaves only the
-        # C++ object alive, so the first callback dispatch aborts with a
-        # Swig::DirectorMethodException.
-        callbacks = _UpgradeTransactionCallbacks(
-            tx_logger, transaction.get_transaction_packages_count()
+        return _execute_resolved_transaction(
+            base, transaction, tx_logger, transaction_description
         )
-        callbacks_ptr = dnf5_rpm.TransactionCallbacksUniquePtr(callbacks)
-        transaction.set_callbacks(callbacks_ptr)
-        result = transaction.run()
-        if (
-            result != dnf5_base.Transaction.TransactionRunResult_SUCCESS
-            or _transaction_has_errors(transaction, tx_logger)
-        ):
-            tx_logger.error(
-                "DNF transaction failed: %s",
-                dnf5_base.Transaction.transaction_result_to_string(result),
-            )
-            for problem in transaction.get_transaction_problems():
-                tx_logger.error(problem)
-            return False
-
-        tx_logger.info("DNF System Updates complete!")
-        return True
-
-    except Exception as e:
-        tx_logger.error("DNF transaction failed: %s", e)
-        return False
+    except KeyboardInterrupt:
+        tx_logger.error("DNF transaction preparation was interrupted.")
+        return DnfTransactionOutcome(
+            False,
+            error="DNF transaction preparation was interrupted",
+            interrupted=True,
+        )
+    except Exception as error:
+        tx_logger.error("DNF transaction failed: %s", error)
+        return DnfTransactionOutcome(False, error=f"DNF transaction failed: {error}")
     finally:
-        del base
+        if base is not None:
+            del base
+
+
+def revert_package_transaction(
+    transaction_id: int,
+    logger: logging.Logger | None = None,
+    *,
+    description: str | None = None,
+) -> DnfTransactionOutcome:
+    """Revert one exact DNF history transaction, including its dependencies."""
+
+    tx_logger = logger if logger is not None else logging.getLogger()
+    transaction_description = (
+        f"{description or f'nobara-updater revert transaction {transaction_id}'} "
+        f"[{uuid.uuid4()}]"
+    )
+    base: dnf5_base.Base | None = None
+    try:
+        base = _prepare_transaction_base(tx_logger, refresh_metadata=False)
+        history_transactions = base.get_transaction_history().list_transactions(
+            transaction_id, transaction_id
+        )
+        if len(history_transactions) != 1:
+            error = f"DNF history transaction {transaction_id} was not found"
+            tx_logger.error(error)
+            return DnfTransactionOutcome(False, error=error)
+
+        history_transaction = history_transactions[0]
+        incomplete_history = (
+            history_transaction.get_state() != dnf5_trans.TransactionState_OK
+        )
+        settings = dnf5_base.GoalJobSettings()
+        if incomplete_history:
+            # A failed/interrupted rpm transaction can contain history items
+            # that never reached the installed state.  Skip those mismatches
+            # while reverting the items that did complete.
+            settings.set_ignore_installed(True)
+            tx_logger.info(
+                "Transaction %s is incomplete; reverting its applied subset.",
+                transaction_id,
+            )
+
+        goal = dnf5_base.Goal(base)
+        # Match dnf5 history undo: dependency packages installed as part of the
+        # original transaction may need to be erased by the inverse goal.
+        goal.set_allow_erasing(True)
+        goal.add_revert_transactions(history_transactions, settings)
+        transaction = goal.resolve()
+        _log_transaction_resolve_problems(transaction, tx_logger)
+        allowed_replay_mismatches = set()
+        if incomplete_history:
+            allowed_replay_mismatches.update(
+                {
+                    dnf5_base.GoalProblem_INSTALLED_IN_DIFFERENT_VERSION,
+                    dnf5_base.GoalProblem_NOT_INSTALLED,
+                    dnf5_base.GoalProblem_NOT_INSTALLED_FOR_ARCHITECTURE,
+                }
+            )
+        resolve_failure = _resolve_failure_reason(
+            transaction,
+            strict_logs=True,
+            allowed_log_problems=allowed_replay_mismatches,
+        )
+        if resolve_failure is not None:
+            return DnfTransactionOutcome(False, error=resolve_failure)
+
+        return _execute_resolved_transaction(
+            base, transaction, tx_logger, transaction_description
+        )
+    except KeyboardInterrupt:
+        tx_logger.error("Rollback of DNF transaction %s was interrupted.", transaction_id)
+        return DnfTransactionOutcome(
+            False,
+            error=f"Rollback of transaction {transaction_id} was interrupted",
+            interrupted=True,
+        )
+    except Exception as error:
+        tx_logger.error("Could not revert DNF transaction %s: %s", transaction_id, error)
+        return DnfTransactionOutcome(
+            False, error=f"Could not revert transaction {transaction_id}: {error}"
+        )
+    finally:
+        if base is not None:
+            del base
+
+
+def run_system_upgrade_transaction(logger: logging.Logger | None = None) -> bool:
+    """Backward-compatible all-package upgrade entry point."""
+
+    return run_package_upgrade_transaction(
+        ["*"],
+        logger,
+        description="nobara-updater system upgrade",
+        refresh_metadata=True,
+    ).success
 
 
 class PackageUpdater:
